@@ -10,19 +10,13 @@
 #include <trace.h>
 #include <kernel/vm.h>
 
-static inline bool page_is_free(const vm_page_t* page) {
-    return page->state == VM_PAGE_STATE_FREE;
-}
-
-// XXX
-extern void dump_page(const vm_page_t* page);
-
 class PmmArena : public mxtl::DoublyLinkedListable<PmmArena*> {
 public:
     PmmArena(const pmm_arena_info_t *info);
     ~PmmArena();
 
-    void boot_alloc_array();
+    // set up the per page structures, allocated out of the boot time allocator
+    void BootAllocArray();
 
     void Dump(bool dump_pages);
 
@@ -70,9 +64,9 @@ public:
 private:
     const pmm_arena_info_t *info_ = nullptr;
 
-    size_t free_count_ = 0;
-
     vm_page_t* page_array_ = nullptr;
+
+    size_t free_count_ = 0;
     list_node free_list_ = LIST_INITIAL_VALUE(free_list_);
 };
 

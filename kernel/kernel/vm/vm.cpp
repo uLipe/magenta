@@ -43,6 +43,10 @@ static void mark_pages_in_use(vaddr_t va, size_t len) {
 
     LTRACEF("aligned va 0x%lx, len 0x%zx\n", va, len);
 
+    list_node list = LIST_INITIAL_VALUE(list);
+
+    paddr_t start_pa = ULONG_MAX;
+    paddr_t runlen = 0;
     for (size_t offset = 0; offset < len; offset += PAGE_SIZE) {
         uint flags;
         paddr_t pa;
@@ -50,13 +54,33 @@ static void mark_pages_in_use(vaddr_t va, size_t len) {
         status_t err = arch_mmu_query(&vmm_aspace_to_obj(vmm_get_kernel_aspace())->arch_aspace(),
                                       va + offset, &pa, &flags);
         if (err >= 0) {
-            // LTRACEF("va 0x%x, pa 0x%x, flags 0x%x, err %d\n", va + offset, pa, flags, err);
+            LTRACEF("va 0x%lx, pa 0x%lx, flags 0x%x, err %d, start_pa 0x%lx runlen 0x%lx\n", va + offset, pa, flags, err, start_pa, runlen);
 
-            // alloate the range, throw the results away
-            pmm_alloc_range(pa, 1, nullptr);
+            // see if we continue the run
+            if (pa == start_pa + runlen) {
+                runlen += PAGE_SIZE;
+            } else {
+                if (start_pa != ULONG_MAX) {
+                    // we just completed the run
+                    pmm_alloc_range(start_pa, runlen / PAGE_SIZE, &list);
+                }
+
+                // starting a new run
+                start_pa = pa;
+                runlen = PAGE_SIZE;
+            }
         } else {
             panic("Could not find pa for va 0x%lx\n", va);
         }
+    }
+
+    if (start_pa != ULONG_MAX && runlen > 0)
+        pmm_alloc_range(start_pa, runlen / PAGE_SIZE, &list);
+
+    // mark all of the pages we allocated as WIRED
+    vm_page_t *p;
+    list_for_every_entry(&list, p, vm_page_t, free.node) {
+        p->state = VM_PAGE_STATE_WIRED;
     }
 }
 

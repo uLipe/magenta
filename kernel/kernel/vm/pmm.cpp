@@ -25,26 +25,12 @@
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
-static mxtl::DoublyLinkedList<PmmArena *> *arena_list;
-static uint8_t arena_list_buf[sizeof(*arena_list)];
+// the main arena list
+static mxtl::DoublyLinkedList<PmmArena *> arena_list;
 static Mutex arena_lock;
 
-#if 0
-#define PAGE_BELONGS_TO_ARENA(page, arena)                    \
-    (((uintptr_t)(page) >= (uintptr_t)(arena)->page_array) && \
-     ((uintptr_t)(page) <                                     \
-      ((uintptr_t)(arena)->page_array + (arena)->size / PAGE_SIZE * sizeof(vm_page_t))))
-
-#define PAGE_ADDRESS_FROM_ARENA(page, arena)                                                           \
-    ((paddr_t)(((uintptr_t)(page) - (uintptr_t)(arena)->page_array) / sizeof(vm_page_t)) * PAGE_SIZE + \
-     (arena)->base)
-
-#define ADDRESS_IN_ARENA(address, arena) \
-    ((address) >= (arena)->base && (address) <= (arena)->base + (arena)->size - 1)
-#endif
-
 paddr_t vm_page_to_paddr(const vm_page_t* page) {
-    for (const auto& a : *arena_list) {
+    for (const auto& a : arena_list) {
         //LTRACEF("testing page %p against arena %p\n", page, &a);
         if (a.page_belongs_to_arena(page)) {
             return a.page_address_from_arena(page);
@@ -54,7 +40,7 @@ paddr_t vm_page_to_paddr(const vm_page_t* page) {
 }
 
 vm_page_t* paddr_to_vm_page(paddr_t addr) {
-    for (auto& a : *arena_list) {
+    for (auto& a : arena_list) {
         if (a.address_in_arena(addr)) {
             size_t index = (addr - a.base()) / PAGE_SIZE;
             return a.get_page(index);
@@ -73,30 +59,20 @@ status_t pmm_add_arena(const pmm_arena_info_t* info) {
     // allocate a c++ arena object
     PmmArena *arena = new (boot_alloc_mem(sizeof(PmmArena))) PmmArena(info);
 
-    static bool first = false;
-    if (!first) {
-        first = true;
-        arena_list = new(arena_list_buf) mxtl::DoublyLinkedList<PmmArena *>;
-
-    }
-
     // walk the arena list and add arena based on priority order
-    LTRACE;
-    for (auto& a : *arena_list) {
-        LTRACE;
+    for (auto& a : arena_list) {
         if (a.priority() > arena->priority()) {
-            LTRACE;
-            arena_list->insert(a, arena);
+            arena_list.insert(a, arena);
             goto done_add;
         }
     }
 
     // walked off the end, add it to the end of the list
-    arena_list->push_back(arena);
+    arena_list.push_back(arena);
 
 done_add:
     // tell the arena to allocate a page array
-    arena->boot_alloc_array();
+    arena->BootAllocArray();
 
     return NO_ERROR;
 }
@@ -105,7 +81,7 @@ vm_page_t* pmm_alloc_page(uint alloc_flags, paddr_t* pa) {
     AutoLock al(arena_lock);
 
     /* walk the arenas in order until we find one with a free page */
-    for (auto& a : *arena_list) {
+    for (auto& a : arena_list) {
         /* skip the arena if it's not KMAP and the KMAP only allocation flag was passed */
         if (alloc_flags & PMM_ALLOC_FLAG_KMAP) {
             if ((a.flags() & PMM_ARENA_FLAG_KMAP) == 0)
@@ -135,7 +111,7 @@ size_t pmm_alloc_pages(size_t count, uint alloc_flags, struct list_node* list) {
     AutoLock al(arena_lock);
 
     /* walk the arenas in order, allocating as many pages as we can from each */
-    for (auto& a : *arena_list) {
+    for (auto& a : arena_list) {
         /* skip the arena if it's not KMAP and the KMAP only allocation flag was passed */
         if (alloc_flags & PMM_ALLOC_FLAG_KMAP) {
             if ((a.flags() & PMM_ARENA_FLAG_KMAP) == 0)
@@ -163,14 +139,14 @@ size_t pmm_alloc_range(paddr_t address, size_t count, struct list_node* list) {
     AutoLock al(arena_lock);
 
     /* walk through the arenas, looking to see if the physical page belongs to it */
-    for (auto& a : *arena_list) {
+    for (auto& a : arena_list) {
         while (allocated < count && a.address_in_arena(address)) {
             vm_page_t *page = a.AllocSpecific(address);
             if (!page)
                 break;
 
             if (list)
-                list_add_tail(list, &page->node);
+                list_add_tail(list, &page->free.node);
 
             allocated++;
             address += PAGE_SIZE;
@@ -194,7 +170,7 @@ size_t pmm_alloc_contiguous(size_t count, uint alloc_flags, uint8_t alignment_lo
 
     AutoLock al(arena_lock);
 
-    for (auto& a : *arena_list) {
+    for (auto& a : arena_list) {
         /* skip the arena if it's not KMAP and the KMAP only allocation flag was passed */
         if (alloc_flags & PMM_ALLOC_FLAG_KMAP) {
             if ((a.flags() & PMM_ARENA_FLAG_KMAP) == 0)
@@ -204,63 +180,6 @@ size_t pmm_alloc_contiguous(size_t count, uint alloc_flags, uint8_t alignment_lo
         count = a.AllocContiguous(count, alignment_log2, pa, list);
         if (count > 0)
             return count;
-
-#if 0
-        /* walk the list starting at alignment boundaries.
-         * calculate the starting offset into this arena, based on the
-         * base address of the arena to handle the case where the arena
-         * is not aligned on the same boundary requested.
-         */
-        paddr_t rounded_base = ROUNDUP(a->base, 1UL << alignment_log2);
-        if (rounded_base < a->base || rounded_base > a->base + a->size - 1)
-            continue;
-
-        paddr_t aligned_offset = (rounded_base - a->base) / PAGE_SIZE;
-        paddr_t start = aligned_offset;
-        LTRACEF("starting search at aligned offset %lu\n", start);
-        LTRACEF("arena base 0x%lx size %zu\n", a->base, a->size);
-
-    retry:
-        /* search while we're still within the arena and have a chance of finding a slot
-           (start + count < end of arena) */
-        while ((start < a->size / PAGE_SIZE) && ((start + count) <= a->size / PAGE_SIZE)) {
-            vm_page_t* p = &a->page_array[start];
-            for (uint i = 0; i < count; i++) {
-                if (!page_is_free(p)) {
-                    /* this run is broken, break out of the inner loop.
-                     * start over at the next alignment boundary
-                     */
-                    start = ROUNDUP(start - aligned_offset + i + 1,
-                                    1UL << (alignment_log2 - PAGE_SIZE_SHIFT)) +
-                            aligned_offset;
-                    goto retry;
-                }
-                p++;
-            }
-
-            /* we found a run */
-            LTRACEF("found run from pn %lu to %lu\n", start, start + count);
-
-            /* remove the pages from the run out of the free list */
-            for (paddr_t i = start; i < start + count; i++) {
-                p = &a->page_array[i];
-                DEBUG_ASSERT(page_is_free(p));
-                DEBUG_ASSERT(list_in_list(&p->node));
-
-                list_delete(&p->node);
-                p->state = VM_PAGE_STATE_ALLOC;
-                a->free_count--;
-
-                if (list)
-                    list_add_tail(list, &p->node);
-            }
-
-            if (pa)
-                *pa = a->base + start * PAGE_SIZE;
-
-            return count;
-        }
-#endif
     }
 
     LTRACEF("couldn't find run\n");
@@ -279,7 +198,7 @@ void* pmm_alloc_kpages(size_t count, struct list_node* list, paddr_t* _pa) {
             return nullptr;
 
         if (list) {
-            list_add_tail(list, &p->node);
+            list_add_tail(list, &p->free.node);
         }
     } else {
         size_t alloc_count =
@@ -298,7 +217,7 @@ void* pmm_alloc_kpages(size_t count, struct list_node* list, paddr_t* _pa) {
 }
 
 /* allocate a single page from a KMAP arena and return its virtual address */
-void* pmm_alloc_kpage(paddr_t* _pa) {
+void* pmm_alloc_kpage(paddr_t* _pa, vm_page_t **_p) {
     LTRACE_ENTRY;
 
     paddr_t pa;
@@ -311,6 +230,8 @@ void* pmm_alloc_kpage(paddr_t* _pa) {
 
     if (_pa)
         *_pa = pa;
+    if (_p)
+        *_p = p;
     return ptr;
 }
 
@@ -325,7 +246,7 @@ size_t pmm_free_kpages(void* _ptr, size_t count) {
     while (count > 0) {
         vm_page_t* p = paddr_to_vm_page(vaddr_to_paddr(ptr));
         if (p) {
-            list_add_tail(&list, &p->node);
+            list_add_tail(&list, &p->free.node);
         }
 
         ptr += PAGE_SIZE;
@@ -344,13 +265,12 @@ size_t pmm_free(struct list_node* list) {
 
     uint count = 0;
     while (!list_is_empty(list)) {
-        vm_page_t* page = list_remove_head_type(list, vm_page_t, node);
+        vm_page_t* page = list_remove_head_type(list, vm_page_t, free.node);
 
-        DEBUG_ASSERT(!list_in_list(&page->node));
         DEBUG_ASSERT(!page_is_free(page));
 
         /* see which arena this page belongs to and add it */
-        for (auto& a : *arena_list) {
+        for (auto& a : arena_list) {
             if (a.FreePage(page) >= 0) {
                 count++;
                 break;
@@ -367,27 +287,9 @@ size_t pmm_free_page(vm_page_t* page) {
     struct list_node list;
     list_initialize(&list);
 
-    list_add_head(&list, &page->node);
+    list_add_head(&list, &page->free.node);
 
     return pmm_free(&list);
-}
-
-static const char* page_state_to_str(const vm_page_t* page) {
-    switch (page->state) {
-    case VM_PAGE_STATE_FREE:
-        return "free";
-    case VM_PAGE_STATE_ALLOC:
-        return "alloc";
-    case VM_PAGE_STATE_MMU:
-        return "mmu";
-    default:
-        return "unknown";
-    }
-}
-
-void dump_page(const vm_page_t* page) {
-    printf("page %p: address 0x%lx state %s flags 0x%x\n", page, vm_page_to_paddr(page),
-           page_state_to_str(page), page->flags);
 }
 
 static int cmd_pmm(int argc, const cmd_args* argv) {
@@ -409,7 +311,7 @@ static int cmd_pmm(int argc, const cmd_args* argv) {
     static struct list_node allocated = LIST_INITIAL_VALUE(allocated);
 
     if (!strcmp(argv[1].str, "arenas")) {
-        for (auto& a : *arena_list) {
+        for (auto& a : arena_list) {
             a.Dump(false);
         }
     } else if (!strcmp(argv[1].str, "alloc")) {
@@ -423,7 +325,7 @@ static int cmd_pmm(int argc, const cmd_args* argv) {
         printf("alloc returns %zu\n", count);
 
         vm_page_t* p;
-        list_for_every_entry (&list, p, vm_page_t, node) {
+        list_for_every_entry (&list, p, vm_page_t, free.node) {
             printf("\tpage %p, address 0x%lx\n", p, vm_page_to_paddr(p));
         }
 
@@ -435,7 +337,7 @@ static int cmd_pmm(int argc, const cmd_args* argv) {
     } else if (!strcmp(argv[1].str, "dump_alloced")) {
         vm_page_t* page;
 
-        list_for_every_entry (&allocated, page, vm_page_t, node) { dump_page(page); }
+        list_for_every_entry (&allocated, page, vm_page_t, free.node) { dump_page(page); }
     } else if (!strcmp(argv[1].str, "alloc_range")) {
         if (argc < 4)
             goto notenoughargs;
@@ -447,7 +349,7 @@ static int cmd_pmm(int argc, const cmd_args* argv) {
         printf("alloc returns %zu\n", count);
 
         vm_page_t* p;
-        list_for_every_entry (&list, p, vm_page_t, node) {
+        list_for_every_entry (&list, p, vm_page_t, free.node) {
             printf("\tpage %p, address 0x%lx\n", p, vm_page_to_paddr(p));
         }
 

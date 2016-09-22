@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <kernel/vm/page.h>
 
 __BEGIN_CDECLS
 
@@ -64,27 +65,6 @@ static_assert(sizeof(struct mmu_initial_mapping) == __MMU_INITIAL_MAPPING_SIZE, 
  * for kernel and enough IO space to boot.
  */
 extern struct mmu_initial_mapping mmu_initial_mappings[];
-
-/* core per page structure */
-typedef struct vm_page {
-    struct {
-        uint32_t state : 2;
-        uint32_t flags : 8;
-    };
-    uint32_t map_count;
-
-    // XXX remove
-    struct list_node node;
-} vm_page_t;
-
-// pmm will maintain pages of this size
-#define VM_PAGE_STRUCT_SIZE (sizeof(vm_page_t))
-
-enum vm_page_state {
-    VM_PAGE_STATE_FREE,
-    VM_PAGE_STATE_ALLOC,
-    VM_PAGE_STATE_MMU, /* allocated to serve arch-specific mmu purposes */
-};
 
 /* kernel address space */
 #ifndef KERNEL_ASPACE_BASE
@@ -174,7 +154,7 @@ size_t pmm_free_page(vm_page_t* page) __NONNULL((1));
 void* pmm_alloc_kpages(size_t count, struct list_node* list, paddr_t* pa);
 
 /* Same as above but a single page at a time */
-void* pmm_alloc_kpage(paddr_t* pa);
+void* pmm_alloc_kpage(paddr_t* pa, vm_page_t **p);
 
 size_t pmm_free_kpages(void* ptr, size_t count);
 

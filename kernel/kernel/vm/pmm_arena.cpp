@@ -17,7 +17,7 @@ PmmArena::PmmArena(const pmm_arena_info_t *info) : info_(info) {}
 
 PmmArena::~PmmArena() {}
 
-void PmmArena::boot_alloc_array() {
+void PmmArena::BootAllocArray() {
     /* allocate an array of pages to back this one */
     size_t page_count = size() / PAGE_SIZE;
     size_t size = page_count * VM_PAGE_STRUCT_SIZE;
@@ -31,14 +31,14 @@ void PmmArena::boot_alloc_array() {
     for (size_t i = 0; i < page_count; i++) {
         auto p = &page_array_[i];
 
-        list_add_tail(&free_list_, &p->node);
+        list_add_tail(&free_list_, &p->free.node);
 
         free_count_++;
     }
 }
 
 vm_page_t* PmmArena::AllocPage(paddr_t* pa) {
-    vm_page_t* page = list_remove_head_type(&free_list_, vm_page_t, node);
+    vm_page_t* page = list_remove_head_type(&free_list_, vm_page_t, free.node);
     if (!page)
         return nullptr;
 
@@ -73,7 +73,7 @@ vm_page_t* PmmArena::AllocSpecific(paddr_t pa) {
         return nullptr;
     }
 
-    list_delete(&page->node);
+    list_delete(&page->free.node);
 
     page->state = VM_PAGE_STATE_ALLOC;
 
@@ -86,7 +86,7 @@ size_t PmmArena::AllocPages(size_t count, list_node *list) {
     size_t allocated = 0;
 
     while (allocated < count) {
-        vm_page_t* page = list_remove_head_type(&free_list_, vm_page_t, node);
+        vm_page_t* page = list_remove_head_type(&free_list_, vm_page_t, free.node);
         if (!page)
             return allocated;
 
@@ -97,7 +97,7 @@ size_t PmmArena::AllocPages(size_t count, list_node *list) {
         DEBUG_ASSERT(page_is_free(page));
 
         page->state = VM_PAGE_STATE_ALLOC;
-        list_add_tail(list, &page->node);
+        list_add_tail(list, &page->free.node);
 
         allocated++;
     }
@@ -145,14 +145,14 @@ retry:
         for (paddr_t i = start; i < start + count; i++) {
             p = &page_array_[i];
             DEBUG_ASSERT(page_is_free(p));
-            DEBUG_ASSERT(list_in_list(&p->node));
+            DEBUG_ASSERT(list_in_list(&p->free.node));
 
-            list_delete(&p->node);
+            list_delete(&p->free.node);
             p->state = VM_PAGE_STATE_ALLOC;
             free_count_--;
 
             if (list)
-                list_add_tail(list, &p->node);
+                list_add_tail(list, &p->free.node);
         }
 
         if (pa)
@@ -171,7 +171,7 @@ status_t PmmArena::FreePage(vm_page_t *page) {
 
     page->state = VM_PAGE_STATE_FREE;
 
-    list_add_head(&free_list_, &page->node);
+    list_add_head(&free_list_, &page->free.node);
     free_count_++;
     return NO_ERROR;
 }
@@ -186,6 +186,17 @@ void PmmArena::Dump(bool dump_pages) {
         for (size_t i = 0; i < size() / PAGE_SIZE; i++) {
             dump_page(&page_array_[i]);
         }
+    }
+
+    /* count the number of pages in every state */
+    size_t state_count[_VM_PAGE_STATE_COUNT] = {};
+    for (size_t i = 0; i < size() / PAGE_SIZE; i++) {
+        state_count[page_array_[i].state]++;
+    }
+
+    printf("\tpage states:\n");
+    for (unsigned int i = 0; i < _VM_PAGE_STATE_COUNT; i++) {
+        printf("\t\t%-12s %-16zu (%zu bytes)\n", page_state_to_string(i), state_count[i], state_count[i] * PAGE_SIZE);
     }
 
     /* dump the free pages */
